@@ -1,0 +1,541 @@
+name: 'Entur/Security/Code Scan'
+
+on:
+  workflow_call:
+    inputs:
+      use_setup_gradle:
+        description: 'OBSOLETE. This is now autodetected and enabled if `build.gradle(.kt(s))` is found. Uses "gradle/action/setup-gradle" before running autobuild (Java/Kotlin/Scala only). Potentially speeds up build times if cache from main branch is utilized'
+        default: false
+        required: false
+        type: boolean
+      codeql_queries:
+        description: 'Comma-separated list of queries for CodeQL to run. By default is set to security-extended.'
+        default: "security-extended"
+        required: false
+        type: string
+      ignore_language:
+        description: 'Comma-separated list of languages for CodeQL or Semgrep to ignore. See [CodeQL Languages](https://github.com/github/codeql-action/blob/main/src/languages.ts) or "scala" for Semgrep'
+        default: ""
+        required: false
+        type: string
+      use_setup_java:
+        description: 'Uses "actions/setup-java" before running CodeQL or Gradle Dependency Graph (Java/Kotlin/Scala only). CodeQL autobuild / Gradle Dependency Graph will use the Java version from "actions/setup-java".'
+        default: false
+        required: false
+        type: boolean
+      use_maven_cache:
+        description: 'Uses "actions/cache" to cache local maven repository, and can speed up autobuild times for CodeQL'
+        default: false
+        required: false
+        type: boolean
+      java_version:
+        description: 'Java version for "actions/setup-java" to use'
+        default: "21"
+        required: false
+        type: string
+      java_distribution:
+        description: 'Java distribution for "actions/setup-java" to use'
+        default: "temurin"
+        required: false
+        type: string
+      java_server_id_artifactory:
+        description: 'Java server id for "actions/setup-java" to use. This will setup maven server with artifactory credentials for CodeQL autobuild to use.'
+        default: ""
+        required: false
+        type: string
+      job_runner:
+        description: 'Customizable job runner for CodeQL or Semgrep jobs that require a little extra performance/memory. List of runners is available in [Confluence](https://enturas.atlassian.net/wiki/spaces/ESP/pages/4989059095/GitHub+Actions+Runners).'
+        default: "ubuntu-24.04"
+        required: false
+        type: string
+      gradle_opts:
+        description: '[Gradle build options](https://docs.gradle.org/current/userguide/build_environment.html#environment_variables_reference) to pass on to the CodeQL scanner'
+        default: "-Dorg.gradle.jvmargs=-Xmx4g"
+        required: false
+        type: string
+    secrets:
+      external_repository_token:
+        description: 'Token to access the external repository mentioned in the codescan.yml file. Must have read access to the repository.'
+        required: false
+      SOFTPAY_NEXUS_USERNAME:
+        description: 'The username for Softpay. Secret is fetched from Entur GitHub organization if secrets are inherited.'
+        required: false
+      SOFTPAY_NEXUS_PASSWORD:
+        description: 'The password for Softpay. Secret is fetched from Entur GitHub organization if secrets are inherited.'
+        required: false
+      ARTIFACTORY_AUTH_USER:
+        description: 'The username for the Artifactory repository. Secret is fetched from Entur GitHub organization if secrets are inherited.'
+        required: false
+      ARTIFACTORY_AUTH_TOKEN:
+        description: 'Token for the Artifactory repository. Secret is fetched from Entur GitHub organization if secrets are inherited.'
+        required: false
+      SLACK_BOT_TOKEN:
+        description: 'Slack bot token is used for notifications. Secret is fetched from Entur GitHub organization if secrets are inherited.'
+        required: false   
+env:
+  GITHUB_REPOSITORY: ${{ github.repository }}
+  GIT_REF: ${{ github.ref }}
+
+jobs:
+  input-validation:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: "Validate inputs"
+        env:
+          CODEQL_QUERIES: ${{ inputs.codeql_queries }}
+        run: |
+          python -c "import re
+          import os
+          codeql_queries = os.environ['CODEQL_QUERIES']
+          regex_matches = re.findall(r'[^,\s?]+', codeql_queries)
+          
+          if (len(regex_matches) <= 0):
+            print('::error ::Invalid input. codeql_queries is set to invalid list. Use a comma-separated list: default, security-extended')
+            exit(1)
+          
+          os.system('echo Validation passed')"
+  upload-cached-results:
+    runs-on:  ubuntu-24.04
+    needs: input-validation
+    outputs:
+      skip_job_and_continue_scan: ${{ env.GHA_SECURITY_CODE_SCAN_SKIP_JOB_AND_CONTINUE_SCAN }}
+    permissions:
+      pull-requests: read
+      actions: read
+      security-events: write
+      contents: write 
+    steps:
+      - name: "Skip job if not triggered by a push to main/master"
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REFNAME: ${{ github.ref_name }}
+          GITHUB_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REFNAME" = "$GITHUB_DEFAULT_BRANCH" ]; then
+            echo 'GHA_SECURITY_CODE_SCAN_SKIP_JOB_AND_CONTINUE_SCAN=False' >> "$GITHUB_ENV"
+          else
+            echo 'GHA_SECURITY_CODE_SCAN_SKIP_JOB_AND_CONTINUE_SCAN=True' >> "$GITHUB_ENV"
+          fi
+      - name: "Get workflow run ID for matching PR"
+        if: ${{ env.GHA_SECURITY_CODE_SCAN_SKIP_JOB_AND_CONTINUE_SCAN == 'False' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          HEAD_REF=$(gh pr list --state merged --search "$GITHUB_SHA" --json headRefOid -R "$GITHUB_REPOSITORY" | jq -r '.[0].headRefOid')
+          if [ "$HEAD_REF" = "null" ]; then
+            echo "::warning ::Failed to fetch closed PRs, defaulting to running a new scan"
+            echo 'GHA_SECURITY_CODE_SCAN_SKIP_JOB_AND_CONTINUE_SCAN=True' >> "$GITHUB_ENV"
+          else
+            JOB_ID=$(gh run list -s completed -e pull_request -c "$HEAD_REF" --json databaseId -R "$GITHUB_REPOSITORY" -w ".github/workflows/codeql.yml" | 
+              jq -r '.[0].databaseId')
+            if [ "$JOB_ID" = "null" ]; then
+              echo '::warning ::Failed to find a matching job, defaulting to running a new scan'
+              echo 'GHA_SECURITY_CODE_SCAN_SKIP_JOB_AND_CONTINUE_SCAN=True' >> "$GITHUB_ENV"
+            else
+              echo "GHA_SECURITY_CODE_SCAN_WORKFLOW_RUN_ID=$JOB_ID" >> "$GITHUB_ENV"
+            fi
+          fi
+
+      - name: "Download existing cached results from previous job (pr)"
+        if: ${{ env.GHA_SECURITY_CODE_SCAN_SKIP_JOB_AND_CONTINUE_SCAN == 'False' }}
+        uses: actions/download-artifact@v7
+        with:
+          run-id: ${{ env.GHA_SECURITY_CODE_SCAN_WORKFLOW_RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: "/home/runner/work/${{ env.GITHUB_REPOSITORY }}/results"
+
+      - name: "Upload scan results"
+        if: ${{ env.GHA_SECURITY_CODE_SCAN_SKIP_JOB_AND_CONTINUE_SCAN == 'False' }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: "/home/runner/work/${{ env.GITHUB_REPOSITORY }}/results"
+          category: 'scan-results'
+
+      - name: "Upload dependency graph"
+        if: ${{ env.GHA_SECURITY_CODE_SCAN_SKIP_JOB_AND_CONTINUE_SCAN == 'False' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
+        run: |
+          shopt -s globstar nullglob
+          for file in "/home/runner/work/$GITHUB_REPOSITORY/results"/**/*.json ; do
+            if [ -d "$file" ] ; then
+              continue
+            fi
+            jq ".sha = \"$GITHUB_SHA\" | .ref = \"$GITHUB_REF\"" < "$file" | 
+              gh api "/repos/$GITHUB_REPOSITORY/dependency-graph/snapshots" --method POST --input -
+          done
+
+  get-repository-metadata:
+    if: ${{ failure() || needs.upload-cached-results.outputs.skip_job_and_continue_scan == 'True' }}
+    runs-on: ubuntu-24.04
+    needs: upload-cached-results
+    outputs: 
+      codeql_languages: ${{ env.GHA_SECURITY_CODE_SCAN_REPOSITORY_LANGUAGES_CQ }}
+      semgrep_languages: ${{ env.GHA_SECURITY_CODE_SCAN_REPOSITORY_LANGUAGES_SEM }} 
+      found_gradle: ${{ env.GHA_SECURITY_CODE_SCAN_FOUND_GRADLE }}
+      html_only_scan: ${{env.GHA_SECURITY_CODE_SCAN_HTML_ONLY_SCAN }}
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: "Find Gradle Build"
+        id: find-gradle-build
+        run: |
+          # Search for the file(s) build.gradle or build.gradle.kt(s) in the repo, and report if any of those are found
+          if [ "$(find . -type f -iname build.gradle -o -iname build.gradle.kts -o -iname build.gradle.kt | wc -l)" -gt 0 ]; then
+            echo "GHA_SECURITY_CODE_SCAN_FOUND_GRADLE=True" >> "$GITHUB_ENV"
+          else
+            echo "GHA_SECURITY_CODE_SCAN_FOUND_GRADLE=False" >> "$GITHUB_ENV"
+          fi
+
+      - name: "Get repository languages"
+        id: get-repository-languages
+        uses: actions/github-script@v8
+        env:
+          IGNORE_LANGUAGE: ${{ inputs.ignore_language }}
+        with:
+          script: |
+            const htmlMappings = {
+              'vue': 'javascript-typescript',
+              'ejs': 'javascript-typescript',
+              'htm': 'javascript-typescript', 
+              'html': 'javascript-typescript',
+              'xhtm': 'javascript-typescript',
+              'xhtml': 'javascript-typescript'
+            }
+
+            const javaScriptTypeScriptMappings = {
+              // Typescript
+              'ts': 'javascript-typescript',
+              'tsx': 'javascript-typescript',
+              'mts': 'javascript-typescript',
+              'cts': 'javascript-typescript',
+              // Javascript
+              'js': 'javascript-typescript',
+              'jsx': 'javascript-typescript',
+              'cjs': 'javascript-typescript',
+              'mjs': 'javascript-typescript',
+              'es': 'javascript-typescript',
+              'es6': 'javascript-typescript'
+            }
+
+            const codeqlMappings = {
+              // Python
+              'py': 'python',
+              // Ruby
+              'rb': 'ruby',
+              'erb': 'ruby',
+              'gemspec': 'ruby',
+              'gemfile': 'ruby',
+              // Swift
+              'swift': 'swift',
+              // Kotlin
+              'kt': 'kotlin',
+              // Java
+              'java': 'java',
+              // CSharp
+              'sln': 'csharp',
+              'csproj': 'csharp',
+              'cs': 'csharp',
+              'cshtml': 'csharp',
+              'xaml': 'csharp',
+              // Golang
+              'go': 'go',
+              // CPP
+              'cpp': 'cpp',
+              'c++': 'cpp',
+              'cxx': 'cpp',
+              'hpp': 'cpp',
+              'hh': 'cpp',
+              'h++': 'cpp',
+              'hxx': 'cpp',
+              'c': 'cpp',
+              'cc': 'cpp',
+              'h': 'cpp',
+              ...javaScriptTypeScriptMappings,
+              ...htmlMappings
+            };
+            
+            const semgrepMappings = {
+              // Scala
+              'scala': 'scala',
+              'sc': 'scala',
+            };
+            
+            const ignoreLanguage = process.env.IGNORE_LANGUAGE
+              .split(',')
+              .map(f => f.trim().toLowerCase())
+              .filter(e => e !== '');
+              
+            const globber = await glob.create('**', { matchDirectories: false });
+            const repoFileTypes = [... new Set(             // Unique array
+              (await globber.glob())                        // Traverse current folder
+                .map(f => f.slice(f.lastIndexOf('/') + 1))  // Get the filename
+                .filter(f => f.lastIndexOf('.') > -1)       // Remove filenames without extension
+                .map(f => f.slice(f.lastIndexOf('.') + 1))  // Get the extension
+            )];
+
+            const hasJavascriptFileType = repoFileTypes.some(f => Object.hasOwn(javaScriptTypeScriptMappings, f));
+            const hasHtmlFileType = repoFileTypes.some(f => Object.hasOwn(htmlMappings, f));
+
+            // Ignore language "javascript-typescript" if HTML file type(s) is found and no additional javascript file types is found.
+            // Needed after CodeQL 2.23.5, see issue: https://github.com/github/codeql/issues/21048
+            if (!hasJavascriptFileType && hasHtmlFileType && ignoreLanguage.includes("html")) {
+              ignoreLanguage.push("javascript-typescript")
+            }
+            
+            const codeqlLanguages = [... new Set(
+              repoFileTypes
+                .filter(f => Object.hasOwn(codeqlMappings, f))
+                .map(f => codeqlMappings[f])
+              ), 'actions']
+            .filter(f => !ignoreLanguage.includes(f));
+            
+            const semgrepLanguages = [... new Set(
+              repoFileTypes
+                .filter(f => Object.hasOwn(semgrepMappings, f))
+                .map(f => semgrepMappings[f])
+            )].filter(f => !ignoreLanguage.includes(f));
+            
+            core.exportVariable("GHA_SECURITY_CODE_SCAN_REPOSITORY_LANGUAGES_CQ", codeqlLanguages);
+            core.exportVariable("GHA_SECURITY_CODE_SCAN_REPOSITORY_LANGUAGES_SEM", semgrepLanguages);
+            core.exportVariable("GHA_SECURITY_CODE_SCAN_HTML_ONLY_SCAN", !hasJavascriptFileType && hasHtmlFileType ? "True" : "False");
+
+  semgrep-analysis:
+    # See https://docs.github.com/en/code-security/code-scanning/creating-an-advanced-setup-for-code-scanning/customizing-your-advanced-setup-for-code-scanning#scanning-on-push
+    # If we found a language, and the event is not a push made by dependabot on a PR
+    if: ${{ needs.get-repository-metadata.outputs.semgrep_languages != '[]' && (github.event_name != 'push' || (github.event_name == 'push' && github.actor != 'dependabot[bot]')) }}
+    runs-on:  ${{ startsWith(inputs.job_runner, 'grp-') && fromJSON(format('{{"group":"{0}"}}', inputs.job_runner)) || inputs.job_runner }}
+    needs: get-repository-metadata
+    permissions:
+      # Semgrep - required for all workflows
+      security-events: write
+      # Semgrep - only required for workflows in private repositories
+      actions: read
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJson(needs.get-repository-metadata.outputs.semgrep_languages) }}
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: "Setup Java for Scala"
+        if: inputs.use_setup_java && (matrix.language == 'scala')
+        uses: entur/gha-security/.github/actions/setup-java-code-scan@v2
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: ${{ inputs.java_distribution }}
+          server-id: ${{ inputs.java_server_id_artifactory }}
+
+      - name: "Gradle Dependency Graph for Scala"
+        if: needs.get-repository-metadata.outputs.found_gradle == 'True' && (matrix.language == 'scala')
+        uses: gradle/actions/dependency-submission@v5
+        env:
+          SOFTPAY_NEXUS_USERNAME: ${{ secrets.SOFTPAY_NEXUS_USERNAME }}
+          SOFTPAY_NEXUS_PASSWORD: ${{ secrets.SOFTPAY_NEXUS_PASSWORD }}
+          ARTIFACTORY_AUTH_USER: ${{ secrets.ARTIFACTORY_AUTH_USER }}
+          ARTIFACTORY_AUTH_TOKEN: ${{ secrets.ARTIFACTORY_AUTH_TOKEN }}
+          ARTIFACTORY_URL: ${{ vars.ARTIFACTORY_URL }}
+        with:
+          cache-read-only: true  # Force read only, even in main
+          add-job-summary: 'on-failure'
+          dependency-graph: ${{ github.ref_name == github.event.repository.default_branch && 'generate-submit-and-upload' || 'generate-and-upload' }}
+          dependency-graph-continue-on-failure: true
+
+      - name: "Set up Semgrep"
+        run: |
+          python3 -m pip install semgrep
+
+      - name: "Scan with Semgrep"
+        run: |
+          semgrep scan --sarif \
+          --sarif-output=semgrep.sarif \
+          --no-secrets-validation \
+          --metrics=off \
+          --config=p/scala \
+          --exclude=*.c \
+          --exclude=*.h \
+          --exclude=*.cpp \
+          --exclude=*.cxx \
+          --exclude=*.cc \
+          --exclude=*.hxx \
+          --exclude=*.cs \
+          --exclude=*.go \
+          --exclude=*.java \
+          --exclude=*.js \
+          --exclude=*.ts \
+          --exclude=*.kt \
+          --exclude=*.py \
+          --exclude=*.rb \
+          --exclude=*.tf \
+          --exclude=*.json \
+          --exclude=*.swift
+
+      - name: "Upload Semgrep report"
+        id: upload-semgrep-report
+        uses: github/codeql-action/upload-sarif@v4
+        with: 
+          sarif_file: semgrep.sarif
+          category: 'semgrep-scan'
+
+      - name: "Upload Semgrep report as artifact"
+        uses: actions/upload-artifact@v6
+        with:
+          name: semgrep-${{ matrix.language }}-sarif
+          path: semgrep.sarif
+          overwrite: true
+
+  codeql-analysis:
+    # See https://docs.github.com/en/code-security/code-scanning/creating-an-advanced-setup-for-code-scanning/customizing-your-advanced-setup-for-code-scanning#scanning-on-push
+    # If we found a language, and the event is not a push made by dependabot on a PR
+    if: ${{ needs.get-repository-metadata.outputs.codeql_languages != '[]' && (github.event_name != 'push' || (github.event_name == 'push' && github.actor != 'dependabot[bot]')) }}
+    # Runners are selected by labels: (default when you pass a string directly to runs-on) or group: "grp-runner". This snippet of code uses JSON to construct the group: object if the runner name starts with "grp-"
+    runs-on:  ${{ startsWith(inputs.job_runner, 'grp-') && fromJSON(format('{{"group":"{0}"}}', inputs.job_runner)) || inputs.job_runner }}
+    needs: get-repository-metadata
+    permissions:
+      # CodeQL - required for all workflows
+      security-events: write
+      # CodeQL - only required for workflows in private repositories
+      actions: read
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJson(needs.get-repository-metadata.outputs.codeql_languages) }}
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      
+      - name: "Setup Java for Java/Kotlin"
+        if: inputs.use_setup_java && (matrix.language == 'kotlin' || matrix.language == 'java')
+        uses: entur/gha-security/.github/actions/setup-java-code-scan@v2
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: ${{ inputs.java_distribution }}
+          server-id: ${{ inputs.java_server_id_artifactory }}
+          use_maven_cache: ${{ inputs.use_maven_cache }}
+
+      - name: "Set up Gradle for Java/Kotlin"
+        if: needs.get-repository-metadata.outputs.found_gradle == 'True' && (matrix.language == 'kotlin' || matrix.language == 'java')
+        uses: gradle/actions/setup-gradle@v5
+        with: 
+          cache-read-only: true  # Force read only, even in main
+          add-job-summary: 'on-failure'
+          dependency-graph: ${{ github.ref_name == github.event.repository.default_branch && 'generate-submit-and-upload' || 'generate-and-upload' }}
+
+      - name: "Initialize CodeQL for Java/Kotlin"
+        if: matrix.language == 'kotlin' || matrix.language == 'java'
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: autobuild
+          queries: ${{ inputs.codeql_queries }}
+
+      - name: "Initialize CodeQL"
+        if: matrix.language != 'java' && matrix.language != 'kotlin'
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          queries: ${{ inputs.codeql_queries }}
+          # CWE-275 is generating a lot of spam on Action scanning despite teams following golden path. Ignore for now.
+          config: |
+            query-filters:
+              - exclude:
+                  id: actions/missing-workflow-permissions
+
+      - name: "Perform CodeQL Analysis"
+        id: codeql-analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
+        env:
+          SOFTPAY_NEXUS_USERNAME: ${{ secrets.SOFTPAY_NEXUS_USERNAME }}
+          SOFTPAY_NEXUS_PASSWORD: ${{ secrets.SOFTPAY_NEXUS_PASSWORD }}
+          ARTIFACTORY_AUTH_USER: ${{ secrets.ARTIFACTORY_AUTH_USER }}
+          ARTIFACTORY_AUTH_TOKEN: ${{ secrets.ARTIFACTORY_AUTH_TOKEN }}
+          ARTIFACTORY_URL: ${{ vars.ARTIFACTORY_URL }}
+          GRADLE_OPTS: ${{ inputs.gradle_opts }}
+          IS_CODEQL_SCAN: true
+
+      - name: "Post message to job summary if scan with HTML only files fail"
+        if: ${{ failure() && steps.codeql-analysis.outcome == 'failure' && needs.get-repository-metadata.outputs.html_only_scan == 'True' && matrix.language == 'javascript-typescript' }}
+        run: |
+          echo -e "# ❗️ CodeQL analysis failed on HTML file(s) \n CodeQL will fail if no javascript can be extracted from HTML file(s).  \n \n Ignore scanning HTML files by adding 'html' to workflow input ignore_language  \n See [CodeQL supported languages and frameworks](https://codeql.github.com/docs/codeql-overview/supported-languages-and-frameworks/#id9) for more information from CodeQL." >> "$GITHUB_STEP_SUMMARY"
+
+
+      - name: "Get repository name"
+        run: |
+          REPOSITORY_NAME=$(echo "${GITHUB_REPOSITORY}" | cut -d'/' -f2)
+          echo "REPOSITORY_NAME=$REPOSITORY_NAME" >> "$GITHUB_ENV"
+
+      - name: "Upload CodeQL report as artifact"
+        uses: actions/upload-artifact@v6
+        with:
+          name: codeql-${{ matrix.language }}-sarif
+          path: "/home/runner/work/${{ env.REPOSITORY_NAME }}/results"
+          overwrite: true
+
+  scanner-action:
+    needs: [codeql-analysis, semgrep-analysis]
+    # If needs jobs have not failed or been cancelled,
+    # and if at least one of the needs has successful run
+    if: ${{ (!failure() && !cancelled()) && (needs.codeql-analysis.result == 'success' || needs.semgrep-analysis.result == 'success') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      # required to read and update code scan alerts
+      security-events: write
+      # required to checkout the repository
+      contents: read
+      issues: write # required for creating issues, and/or adding issue comments
+      pull-requests: write # required for creating comments on pull requests
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      
+      - name: Scanner Action
+        id: scanner-action
+        uses: entur/gha-security/scanner-action@v2
+        with:
+          scanner: 'codescan'
+          token: ${{ secrets.GITHUB_TOKEN }}
+          external-repository-token: ${{ secrets.external_repository_token }}
+
+      - name: "Send pull request notification"
+        if: ${{ github.event_name == 'pull_request' && steps.scanner-action.outputs.notification_pull_request_enabled == 'True' && steps.scanner-action.outputs.notification_severity_alert_found == 'True' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          NOTIFICATION_MARKDOWN: ${{ steps.scanner-action.outputs.notification_markdown }}
+        run: |
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" -b "$NOTIFICATION_MARKDOWN"
+
+      - name: "Send job summary notification"
+        if: ${{ steps.scanner-action.outputs.notification_severity_alert_found == 'True' }}
+        env:
+          NOTIFICATION_MARKDOWN: ${{ steps.scanner-action.outputs.notification_markdown }}
+        run: |
+          echo "$NOTIFICATION_MARKDOWN" >> "$GITHUB_STEP_SUMMARY"
+      # Taken from https://github.com/entur/gha-slack/blob/main/.github/workflows/post.yml
+      - name: "Send slack notification"
+        if: ${{ steps.scanner-action.outputs.notification_slack_enabled == 'True' && steps.scanner-action.outputs.notification_severity_alert_found == 'True' }}
+        uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a # v2.1.1.27.2.1.1
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          NOTIFICATION_SLACK_POST_BLOCKS: ${{ steps.scanner-action.outputs.notification_slack_block }}
+        with:
+          channel-id: ${{ steps.scanner-action.outputs.notification_slack_channel_id }}
+          payload: |
+            ${{ env.NOTIFICATION_SLACK_POST_BLOCKS }}
