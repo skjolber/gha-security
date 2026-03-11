@@ -3,11 +3,6 @@ name: 'Entur/Security/Code Scan'
 on:
   workflow_call:
     inputs:
-      use_setup_gradle:
-        description: 'OBSOLETE. This is now autodetected and enabled if `build.gradle(.kt(s))` is found. Uses "gradle/action/setup-gradle" before running autobuild (Java/Kotlin/Scala only). Potentially speeds up build times if cache from main branch is utilized'
-        default: false
-        required: false
-        type: boolean
       codeql_queries:
         description: 'Comma-separated list of queries for CodeQL to run. By default is set to security-extended.'
         default: "security-extended"
@@ -94,84 +89,11 @@ jobs:
             exit(1)
           
           os.system('echo Validation passed')"
-  upload-cached-results:
-    runs-on:  ubuntu-24.04
-    needs: input-validation
-    outputs:
-      skip_job_and_continue_scan: ${{ env.GHA_SECURITY_CODE_SCAN_SKIP_JOB_AND_CONTINUE_SCAN }}
-    permissions:
-      pull-requests: read
-      actions: read
-      security-events: write
-      contents: write 
-    steps:
-      - name: "Skip job if not triggered by a push to main/master"
-        env:
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
-          GITHUB_REFNAME: ${{ github.ref_name }}
-          GITHUB_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REFNAME" = "$GITHUB_DEFAULT_BRANCH" ]; then
-            echo 'GHA_SECURITY_CODE_SCAN_SKIP_JOB_AND_CONTINUE_SCAN=False' >> "$GITHUB_ENV"
-          else
-            echo 'GHA_SECURITY_CODE_SCAN_SKIP_JOB_AND_CONTINUE_SCAN=True' >> "$GITHUB_ENV"
-          fi
-      - name: "Get workflow run ID for matching PR"
-        if: ${{ env.GHA_SECURITY_CODE_SCAN_SKIP_JOB_AND_CONTINUE_SCAN == 'False' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_SHA: ${{ github.sha }}
-        run: |
-          HEAD_REF=$(gh pr list --state merged --search "$GITHUB_SHA" --json headRefOid -R "$GITHUB_REPOSITORY" | jq -r '.[0].headRefOid')
-          if [ "$HEAD_REF" = "null" ]; then
-            echo "::warning ::Failed to fetch closed PRs, defaulting to running a new scan"
-            echo 'GHA_SECURITY_CODE_SCAN_SKIP_JOB_AND_CONTINUE_SCAN=True' >> "$GITHUB_ENV"
-          else
-            JOB_ID=$(gh run list -s completed -e pull_request -c "$HEAD_REF" --json databaseId -R "$GITHUB_REPOSITORY" -w ".github/workflows/codeql.yml" | 
-              jq -r '.[0].databaseId')
-            if [ "$JOB_ID" = "null" ]; then
-              echo '::warning ::Failed to find a matching job, defaulting to running a new scan'
-              echo 'GHA_SECURITY_CODE_SCAN_SKIP_JOB_AND_CONTINUE_SCAN=True' >> "$GITHUB_ENV"
-            else
-              echo "GHA_SECURITY_CODE_SCAN_WORKFLOW_RUN_ID=$JOB_ID" >> "$GITHUB_ENV"
-            fi
-          fi
-
-      - name: "Download existing cached results from previous job (pr)"
-        if: ${{ env.GHA_SECURITY_CODE_SCAN_SKIP_JOB_AND_CONTINUE_SCAN == 'False' }}
-        uses: actions/download-artifact@v7
-        with:
-          run-id: ${{ env.GHA_SECURITY_CODE_SCAN_WORKFLOW_RUN_ID }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          path: "/home/runner/work/${{ env.GITHUB_REPOSITORY }}/results"
-
-      - name: "Upload scan results"
-        if: ${{ env.GHA_SECURITY_CODE_SCAN_SKIP_JOB_AND_CONTINUE_SCAN == 'False' }}
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: "/home/runner/work/${{ env.GITHUB_REPOSITORY }}/results"
-          category: 'scan-results'
-
-      - name: "Upload dependency graph"
-        if: ${{ env.GHA_SECURITY_CODE_SCAN_SKIP_JOB_AND_CONTINUE_SCAN == 'False' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_SHA: ${{ github.sha }}
-          GITHUB_REF: ${{ github.ref }}
-        run: |
-          shopt -s globstar nullglob
-          for file in "/home/runner/work/$GITHUB_REPOSITORY/results"/**/*.json ; do
-            if [ -d "$file" ] ; then
-              continue
-            fi
-            jq ".sha = \"$GITHUB_SHA\" | .ref = \"$GITHUB_REF\"" < "$file" | 
-              gh api "/repos/$GITHUB_REPOSITORY/dependency-graph/snapshots" --method POST --input -
-          done
 
   get-repository-metadata:
-    if: ${{ failure() || needs.upload-cached-results.outputs.skip_job_and_continue_scan == 'True' }}
+    if: ${{ always() }}
     runs-on: ubuntu-24.04
-    needs: upload-cached-results
+    needs: input-validation
     outputs: 
       codeql_languages: ${{ env.GHA_SECURITY_CODE_SCAN_REPOSITORY_LANGUAGES_CQ }}
       semgrep_languages: ${{ env.GHA_SECURITY_CODE_SCAN_REPOSITORY_LANGUAGES_SEM }} 
@@ -317,7 +239,6 @@ jobs:
       security-events: write
       # Semgrep - only required for workflows in private repositories
       actions: read
-      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -327,29 +248,6 @@ jobs:
         uses: actions/checkout@v6
         with:
           persist-credentials: false
-
-      - name: "Setup Java for Scala"
-        if: inputs.use_setup_java && (matrix.language == 'scala')
-        uses: entur/gha-security/.github/actions/setup-java-code-scan@v2
-        with:
-          java-version: ${{ inputs.java_version }}
-          distribution: ${{ inputs.java_distribution }}
-          server-id: ${{ inputs.java_server_id_artifactory }}
-
-      - name: "Gradle Dependency Graph for Scala"
-        if: needs.get-repository-metadata.outputs.found_gradle == 'True' && (matrix.language == 'scala')
-        uses: gradle/actions/dependency-submission@v5
-        env:
-          SOFTPAY_NEXUS_USERNAME: ${{ secrets.SOFTPAY_NEXUS_USERNAME }}
-          SOFTPAY_NEXUS_PASSWORD: ${{ secrets.SOFTPAY_NEXUS_PASSWORD }}
-          ARTIFACTORY_AUTH_USER: ${{ secrets.ARTIFACTORY_AUTH_USER }}
-          ARTIFACTORY_AUTH_TOKEN: ${{ secrets.ARTIFACTORY_AUTH_TOKEN }}
-          ARTIFACTORY_URL: ${{ vars.ARTIFACTORY_URL }}
-        with:
-          cache-read-only: true  # Force read only, even in main
-          add-job-summary: 'on-failure'
-          dependency-graph: ${{ github.ref_name == github.event.repository.default_branch && 'generate-submit-and-upload' || 'generate-and-upload' }}
-          dependency-graph-continue-on-failure: true
 
       - name: "Set up Semgrep"
         run: |
@@ -406,7 +304,6 @@ jobs:
       security-events: write
       # CodeQL - only required for workflows in private repositories
       actions: read
-      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -472,7 +369,6 @@ jobs:
         if: ${{ failure() && steps.codeql-analysis.outcome == 'failure' && needs.get-repository-metadata.outputs.html_only_scan == 'True' && matrix.language == 'javascript-typescript' }}
         run: |
           echo -e "# ❗️ CodeQL analysis failed on HTML file(s) \n CodeQL will fail if no javascript can be extracted from HTML file(s).  \n \n Ignore scanning HTML files by adding 'html' to workflow input ignore_language  \n See [CodeQL supported languages and frameworks](https://codeql.github.com/docs/codeql-overview/supported-languages-and-frameworks/#id9) for more information from CodeQL." >> "$GITHUB_STEP_SUMMARY"
-
 
       - name: "Get repository name"
         run: |
